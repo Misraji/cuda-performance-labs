@@ -26,8 +26,11 @@ namespace cg = cooperative_groups;
 
 constexpr int BLOCK_SIZE = 256;
 
-// V0: Essentially uses no parallelization. ONLY 1 GPU thread (thread 0)
-// to calculate the values. Essentially CPU code executed in the GPU.
+// V0: Essentially uses no parallelization. Essentially, we are
+// - Using 1 block per row.
+// - ONLY 1 GPU thread (thread 0) per Block.
+// to calculate the values for every row.
+// Essentially CPU code executed in the GPU.
 __global__ void softmax_v0(const float* input, float* output, int rows,
                            int cols) {
   int row = blockIdx.x;
@@ -54,8 +57,61 @@ __global__ void softmax_v0(const float* input, float* output, int rows,
   }
 }
 
+// V1: Essentially, we are still using 1 block per Row. However, this
+// version now uses multiple threads, per block, to calculate the
+// softmax value for the column.
 __global__ void softmax_v1(const float* input, float* output, int rows,
-                           int cols) {}
+                           int cols) {
+  int row = blockIdx.x;
+  if (row >= rows) {
+    return;
+  }
+
+  const float* x = input + row * cols;
+  float* y = output + row * cols;
+
+  extern __shared__ float shared[];
+  float local_max = -CUDART_INF_F;
+  __syncthreads();
+
+  // All threads in the block, iterate and find the local max
+  // for their "series".
+  for (int col = threadIdx.x; col < cols; col += blockDim.x) {
+    local_max = fmaxf(local_max, x[col]);
+  }
+  shared[threadIdx.x] = local_max;
+  __syncthreads();
+
+  // Here we always have initial "stride" number of threads,
+  // accumulating from next stride threads.
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      shared[threadIdx.x] =
+          fmaxf(shared[threadIdx.x], shared[threadIdx.x + stride]);
+    }
+    __syncthreads();
+  }
+  float max_value = shared[0];
+
+  float local_sum = 0.0f;
+  for (int col = threadIdx.x; col < cols; col += blockDim.x) {
+    local_sum += expf(x[col] - max_value);
+  }
+  shared[threadIdx.x] = local_sum;
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      shared[threadIdx.x] += shared[threadIdx.x + stride];
+    }
+    __syncthreads();
+  }
+  float sum = shared[0];
+
+  for (int col = threadIdx.x; col < cols; col += blockDim.x) {
+    y[col] = expf(x[col] - max_value) / sum;
+  }
+}
+
 __global__ void softmax_v2(const float* input, float* output, int rows,
                            int cols) {}
 __global__ void softmax_v3(const float* input, float* output, int rows,
@@ -67,14 +123,19 @@ void launch(const std::string& version, const float* input, float* output,
             int rows, int cols) {
   if (version == "v0") {
     softmax_v0<<<rows, 1>>>(input, output, rows, cols);
+
   } else if (version == "1") {
     softmax_v1<<<rows, BLOCK_SIZE>>>(input, output, rows, cols);
+
   } else if (version == "2") {
     softmax_v2<<<rows, BLOCK_SIZE>>>(input, output, rows, cols);
+
   } else if (version == "3") {
     softmax_v3<<<rows, BLOCK_SIZE>>>(input, output, rows, cols);
+
   } else if (version == "4") {
     softmax_v4<<<rows, BLOCK_SIZE>>>(input, output, rows, cols);
+
   } else {
     std::cerr << "Version must be v0, v1, v2, v3 or v4.\n";
     std::exit(1);
