@@ -26,6 +26,8 @@ namespace cg = cooperative_groups;
 
 constexpr int BLOCK_SIZE = 256;
 
+// V0: Essentially uses no parallelization. ONLY 1 GPU thread (thread 0)
+// to calculate the values. Essentially CPU code executed in the GPU.
 __global__ void softmax_v0(const float* input, float* output, int rows,
                            int cols) {
   int row = blockIdx.x;
@@ -107,15 +109,18 @@ int main(int argc, char** argv) {
     std::cerr << "usage: ./softmax v0|v1|v2|v3|v3 \n";
     return 1;
   }
+  const std::string version = argv[1];
 
-  std::string version = argv[1];
-  constexpr int rows = 4096, cols = 1024, warmups = 10, iterations = 100;
+  constexpr int rows = 4096;
+  constexpr int cols = 1024;
+  constexpr int warmups = 10;
+  constexpr int iterations = 100;
+
   size_t elements = (size_t)rows * cols;
   size_t bytes = elements * sizeof(float);
 
-  std::vector<float> h_input(elements), h_output(elements),
-      h_reference(elements);
-
+  // Create input array.
+  std::vector<float> h_input(elements);
   std::mt19937 rng(12345);
   std::uniform_real_distribution<float> distribution(-4.0f, 4.0f);
   for (float& value : h_input) {
@@ -123,10 +128,13 @@ int main(int argc, char** argv) {
   }
 
   std::cout << "Computing CPU Reference ... \n";
+  std::vector<float> h_reference(elements);
   cpu_softmax(h_input, h_reference, rows, cols);
 
   float *d_input = nullptr, *d_output = nullptr;
 
+  // Prepare for Device invocation and computation.
+  // Allocate and prefill memory on device.
   CUDA_CHECK(cudaMalloc(&d_input, bytes));
   CUDA_CHECK(cudaMalloc(&d_output, bytes));
 
@@ -141,6 +149,7 @@ int main(int argc, char** argv) {
   CUDA_CHECK(cudaEventCreate(&start));
   CUDA_CHECK(cudaEventCreate(&stop));
 
+  // Initiate actual computation on the Device.
   CUDA_CHECK(cudaEventRecord(start));
   for (int i = 0; i < iterations; ++i) {
     launch(version, d_input, d_output, rows, cols);
@@ -151,6 +160,8 @@ int main(int argc, char** argv) {
   float milliseconds = 0.0f;
   CUDA_CHECK(cudaEventElapsedTime(&milliseconds, start, stop));
 
+  // Copy output from Device to Host, to the vector, h_output.
+  std::vector<float> h_output(elements);
   CUDA_CHECK(
       cudaMemcpy(h_output.data(), d_output, bytes, cudaMemcpyDeviceToHost));
   float max_error = 0.0f;
