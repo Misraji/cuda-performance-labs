@@ -267,8 +267,72 @@ __global__ void softmax_v3(const float* input, float* output, int rows,
   }
 }
 
+// V4: This version uses cooperative groups and tiles.
 __global__ void softmax_v4(const float* input, float* output, int rows,
-                           int cols) {}
+                           int cols) {
+  int row = blockIdx.x;
+  if (row > rows) {
+    return;
+  }
+
+  cg::thread_block block = cg::this_thread_block();
+  cg::thread_block_tile<32> tile = cg::tiled_partition<32>(block);
+
+  // Allocated shared memory to hold intermediate warp results.
+  __shared__ float warp_values[32];
+  const int thread_id = block.thread_rank();
+  const int lane = tile.thread_rank();
+  const int warp_id = block.thread_rank() >> 5;
+  const int num_warps = (block.num_threads() + warpSize - 1) / warpSize;
+
+  const float* x = input + row * cols;
+  float* y = output + row * cols;
+
+  float local_max = -CUDART_INF_F;
+  for (int col = block.thread_rank(); col < cols; col += block.num_threads()) {
+    local_max = fmaxf(local_max, x[col]);
+  }
+  float warp_max = cg::reduce(tile, local_max, cg::greater<float>());
+  if (lane == 0) {
+    warp_values[warp_id] = warp_max;
+  }
+  block.sync();
+  if (warp_id == 0) {
+    float value = lane < num_warps ? warp_values[lane] : 0.0f;
+    float block_sum = cg::reduce(tile, value, cg::plus<float>());
+
+    if (lane == 0) {
+      warp_values[0] = block_sum;
+    }
+  }
+  block.sync();
+  const float max_value = warp_values[0];
+
+  float local_sum = 0.0f;
+  for (int col = block.thread_rank(); col < cols; col += block.num_threads()) {
+    local_sum = expf(x[col] - max_value);
+  }
+  float warp_sum = cg::reduce(tile, local_sum, cg::plus<float>());
+  if (lane == 0) {
+    warp_values[warp_id] = warp_sum;
+  }
+  block.sync();
+  if (warp_id == 0) {
+    float value = lane < num_warps ? warp_values[lane] : 0.0f;
+
+    float block_sum = cg::reduce(tile, value, cg::plus<float>());
+
+    if (lane == 0) {
+      warp_values[0] = block_sum;
+    }
+  }
+  block.sync();
+  const float sum = warp_values[0];
+
+  for (int col = block.thread_rank(); col < cols; col += block.num_threads()) {
+    y[col] = expf(x[col] - max_value) / sum;
+  }
+}
 
 void launch(const std::string& version, const float* input, float* output,
             int rows, int cols) {
