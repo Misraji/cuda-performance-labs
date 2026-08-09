@@ -5,7 +5,9 @@
 __global__ void BadKernel(float* data, int n) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   // Intentionally missing the if(i < n) check.
-  data[i] = static_cast<float>(i);
+  if (i < n) {
+    data[i] = static_cast<float>(i);
+  }
 }
 
 int main() {
