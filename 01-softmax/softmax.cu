@@ -112,10 +112,161 @@ __global__ void softmax_v1(const float* input, float* output, int rows,
   }
 }
 
+__device__ float warp_reduce_max(float value) {
+  for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+    value = fmaxf(value, __shfl_down_sync(0xffffffff, value, offset));
+  }
+  return value;
+}
+
+__device__ float warp_reduce_sum(float value) {
+  for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+    value += __shfl_down_sync(0xffffffff, value, offset);
+  }
+  return value;
+}
+
+// v2: 1 Block per row. Every block has multiple threads.
+// This version uses Warp shuffle primitives to speed up processing.
 __global__ void softmax_v2(const float* input, float* output, int rows,
-                           int cols) {}
+                           int cols) {
+  int row = blockIdx.x;
+  if (row > rows) {
+    return;
+  }
+
+  const float* x = input + row * cols;
+  float* y = output + row * cols;
+
+  constexpr int kMaxWarps = 32;
+  __shared__ float warp_values[kMaxWarps];
+  int lane = threadIdx.x & (warpSize - 1);
+  int warp_id = threadIdx.x >> 5;
+  int num_warps = blockDim.x / warpSize;
+
+  // Warp Level computation of max.
+  float local_max = -CUDART_INF_F;
+  for (int col = threadIdx.x; col < cols; col += blockDim.x) {
+    local_max = fmaxf(local_max, x[col]);
+  }
+  float warp_max = warp_reduce_max(local_max);
+  if (lane == 0) {
+    warp_values[warp_id] = warp_max;
+  }
+  __syncthreads();
+  float block_max = -CUDART_INF_F;
+  if (warp_id == 0) {
+    block_max = lane < num_warps ? warp_values[lane] : -CUDART_INF_F;
+    block_max = warp_reduce_max(block_max);
+    if (lane == 0) {
+      warp_values[0] = block_max;
+    }
+  }
+  __syncthreads();
+  block_max = warp_values[0];
+
+  // Similar warp level computation of sum.
+  float local_sum = 0.0f;
+  for (int col = threadIdx.x; col < cols; col += blockDim.x) {
+    local_sum += expf(x[col] - block_max);
+  }
+  float warp_sum = warp_reduce_sum(local_sum);
+  if (lane == 0) {
+    warp_values[warp_id] = warp_sum;
+  }
+  __syncthreads();
+  float block_sum = 0.0f;
+  if (warp_id == 0) {
+    block_sum = lane < num_warps ? warp_values[lane] : 0.0f;
+    block_sum = warp_reduce_sum(block_sum);
+    if (lane == 0) {
+      warp_values[0] = block_sum;
+    }
+  }
+  __syncthreads();
+
+  block_sum = warp_values[0];
+  for (int col = threadIdx.x; col < cols; col += blockDim.x) {
+    y[col] = expf(x[col] - block_max) / block_sum;
+  }
+}
+
 __global__ void softmax_v3(const float* input, float* output, int rows,
-                           int cols) {}
+                           int cols) {
+  int row = blockIdx.x;
+  if (row >= rows || (cols % 4) != 0) {
+    return;
+  }
+
+  const float4* x = reinterpret_cast<const float4*>(input + row * cols);
+  float4* y = reinterpret_cast<float4*>(output + row * cols);
+
+  int cols4 = cols / 4;
+  __shared__ float
+      warp_values[32];  // Maximum number of warps in a block is 32.
+
+  int lane = threadIdx.x & (warpSize - 1);
+  int warp_id = threadIdx.x >> 5;
+  int num_warps = (blockDim.x + warpSize - 1) / warpSize;
+
+  float local_max = -CUDART_INF_F;
+  for (int col4 = threadIdx.x; col4 < cols4; col4 += blockDim.x) {
+    float4 v = x[col4];
+    local_max = fmaxf(local_max, v.x);
+    local_max = fmaxf(local_max, v.y);
+    local_max = fmaxf(local_max, v.z);
+    local_max = fmaxf(local_max, v.w);
+  }
+
+  float warp_max = warp_reduce_max(local_max);
+  if (lane == 0) {
+    warp_values[warp_id] = warp_max;
+  }
+  __syncthreads();
+
+  if (warp_id == 0) {
+    float block_max = lane < num_warps ? warp_values[lane] : -CUDART_INF_F;
+    block_max = warp_reduce_max(block_max);
+    if (lane == 0) {
+      warp_values[0] = block_max;
+    }
+  }
+  __syncthreads();
+  float max_value = warp_values[0];
+
+  float local_sum = 0.0f;
+  for (int col4 = threadIdx.x; col4 < cols4; col4 += blockDim.x) {
+    float4 v = x[col4];
+    local_sum += expf(v.x - max_value) + expf(v.y - max_value) +
+                 expf(v.z - max_value) + expf(v.w - max_value);
+  }
+  float warp_sum = warp_reduce_sum(local_sum);
+  if (lane == 0) {
+    warp_values[warp_id] = warp_sum;
+  }
+  __syncthreads();
+
+  if (warp_id == 0) {
+    float block_sum = lane < num_warps ? warp_values[lane] : 0.0f;
+    block_sum = warp_reduce_sum(block_sum);
+    if (lane == 0) {
+      warp_values[0] = block_sum;
+    }
+  }
+  __syncthreads();
+  float sum = warp_values[0];
+
+  for (int col4 = threadIdx.x; col4 < cols4; col4 += blockDim.x) {
+    float4 v = x[col4];
+    float4 result;
+    result.x = expf(v.x - max_value) / sum;
+    result.y = expf(v.y - max_value) / sum;
+    result.z = expf(v.z - max_value) / sum;
+    result.w = expf(v.w - max_value) / sum;
+    y[col4] = result;
+  }
+}
+
 __global__ void softmax_v4(const float* input, float* output, int rows,
                            int cols) {}
 
@@ -124,16 +275,16 @@ void launch(const std::string& version, const float* input, float* output,
   if (version == "v0") {
     softmax_v0<<<rows, 1>>>(input, output, rows, cols);
 
-  } else if (version == "1") {
+  } else if (version == "v1") {
     softmax_v1<<<rows, BLOCK_SIZE>>>(input, output, rows, cols);
 
-  } else if (version == "2") {
+  } else if (version == "v2") {
     softmax_v2<<<rows, BLOCK_SIZE>>>(input, output, rows, cols);
 
-  } else if (version == "3") {
+  } else if (version == "v3") {
     softmax_v3<<<rows, BLOCK_SIZE>>>(input, output, rows, cols);
 
-  } else if (version == "4") {
+  } else if (version == "v4") {
     softmax_v4<<<rows, BLOCK_SIZE>>>(input, output, rows, cols);
 
   } else {
